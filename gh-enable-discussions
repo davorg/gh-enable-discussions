@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  enable-discussions --owner OWNER [--limit N] [--dry-run] [--only-when-disabled]
+
+Options:
+  --owner OWNER           GitHub user or organisation login
+  --limit N               Max repos to fetch (default: 2000)
+  --dry-run               Print actions without changing anything
+  --only-when-disabled    Check has_discussions and only act when false
+  -h, --help              Show this help
+
+Examples:
+  enable-discussions --owner my-org
+  enable-discussions --owner davorg --dry-run --only-when-disabled
+EOF
+}
+
+OWNER=""
+LIMIT=2000
+DRY_RUN=0
+ONLY_WHEN_DISABLED=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --owner) OWNER="${2:-}"; shift 2 ;;
+    --limit) LIMIT="${2:-}"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --only-when-disabled) ONLY_WHEN_DISABLED=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+if [[ -z "$OWNER" ]]; then
+  echo "Error: --owner is required" >&2
+  usage
+  exit 2
+fi
+
+# Ensure gh is available and authenticated
+command -v gh >/dev/null 2>&1 || { echo "Error: gh not found" >&2; exit 127; }
+gh auth status >/dev/null 2>&1 || { echo "Error: gh not authenticated (run: gh auth login)" >&2; exit 1; }
+
+# Get repos
+mapfile -t REPOS < <(
+  gh repo list "$OWNER" --limit "$LIMIT" --json nameWithOwner --jq '.[].nameWithOwner'
+)
+
+if [[ ${#REPOS[@]} -eq 0 ]]; then
+  echo "No repositories found for owner '$OWNER' (or you lack access)." >&2
+  exit 1
+fi
+
+changed=0
+skipped=0
+failed=0
+
+for REPO in "${REPOS[@]}"; do
+  if [[ $ONLY_WHEN_DISABLED -eq 1 ]]; then
+    # REST: GET /repos/{owner}/{repo} gives has_discussions
+    HAS_DISCUSSIONS=$(
+      gh api "repos/$REPO" --jq '.has_discussions'
+    )
+
+    if [[ "$HAS_DISCUSSIONS" == "true" ]]; then
+      echo "SKIP  $REPO (already enabled)"
+      ((skipped++)) || true
+      continue
+    fi
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "DRY   $REPO -> enable discussions"
+    ((changed++)) || true
+    continue
+  fi
+
+  if gh repo edit "$REPO" --enable-discussions >/dev/null; then
+    echo "OK    $REPO"
+    ((changed++)) || true
+  else
+    echo "FAIL  $REPO" >&2
+    ((failed++)) || true
+  fi
+done
+
+echo
+echo "Summary:"
+echo "  would/changed: $changed"
+echo "  skipped:       $skipped"
+echo "  failed:        $failed"
+
+if [[ $failed -gt 0 ]]; then
+  exit 1
+fi
+
